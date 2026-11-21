@@ -1,0 +1,7 @@
+logs/
+*.pdb
+*.obj
+*.lib
+*.exp
+.vs/
+/dst_animation_tween.dll

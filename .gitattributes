@@ -1,0 +1,8 @@
+* text=auto
+*.lua text eol=lf
+*.cpp text eol=lf
+*.inl text eol=lf
+*.md text eol=lf
+*.ps1 text eol=crlf
+*.dll binary
+*.dll.pkg binary
