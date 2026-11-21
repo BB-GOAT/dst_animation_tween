@@ -435,8 +435,68 @@ void CheckIdentityRegisters() {
     VirtualFree(memory,0,MEM_RELEASE);
 }
 
+void CheckLogRotation() {
+    assert(IsSessionLog(L"animation_tween-20261122-0642.log"));
+    assert(IsSessionLog(L"animation_tween-20261122-064200-000-123.log"));
+    assert(!IsSessionLog(L"animation_tween-20261122-064.log"));
+    assert(!IsSessionLog(L"animation_tween-20261122-06x2.log"));
+    wchar_t executable[32768]{};
+    assert(GetModuleFileNameW(nullptr, executable, 32768));
+    std::wstring root(executable);
+    root.resize(root.find_last_of(L"\\/"));
+    root += L"\\log-rotation-" + std::to_wstring(GetCurrentProcessId());
+    assert(CreateDirectoryW(root.c_str(), nullptr));
+    auto touch = [&](const std::wstring& name) {
+        FILE* file = nullptr;
+        assert(!_wfopen_s(&file, (root + L"\\" + name).c_str(), L"wb") && file);
+        fputs("keep\n", file);
+        fclose(file);
+    };
+    for (unsigned i = 0; i < 15; ++i) {
+        wchar_t name[128]{};
+        if (i % 2) swprintf_s(name, L"animation_tween-20000101-00%02u.log", i);
+        else swprintf_s(name, L"animation_tween-20000101-000000-000-%02u.log", i);
+        touch(name);
+    }
+    touch(L"animation_tween.log");
+    touch(L"unrelated.log");
+    touch(L"animation_tween-not-a-session.log");
+    // 日志初始化失败不能清理旧记录或设置成功标志。
+    assert(!PrepareSessionLog(root + L"\\unrelated.log"));
+    assert(g_logPath.empty());
+    assert(PrepareSessionLog(root));
+    const auto session = g_logPath;
+    assert(session.substr(session.find_last_of(L"\\/") + 1).size() == 33);
+    Log("first_marker");
+    assert(PrepareLog() && g_logPath == session);
+    assert(PrepareSessionLog(root) && g_logPath == session);
+    Log("second_marker");
+    FILE* file = nullptr;
+    assert(!_wfopen_s(&file, session.c_str(), L"rb") && file);
+    char contents[512]{};
+    const auto length = fread(contents, 1, sizeof(contents) - 1, file);
+    fclose(file);
+    assert(length && strstr(contents, "first_marker") && strstr(contents, "second_marker"));
+    assert(GetFileAttributesW((root + L"\\animation_tween.log").c_str()) == INVALID_FILE_ATTRIBUTES);
+    unsigned owned = 0, unrelated = 0;
+    WIN32_FIND_DATAW item{};
+    HANDLE search = FindFirstFileW((root + L"\\*").c_str(), &item);
+    assert(search != INVALID_HANDLE_VALUE);
+    do {
+        if (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (IsSessionLog(item.cFileName)) ++owned;
+        else ++unrelated;
+        assert(DeleteFileW((root + L"\\" + item.cFileName).c_str()));
+    } while (FindNextFileW(search, &item));
+    FindClose(search);
+    assert(owned == 10 && unrelated == 2);
+    assert(RemoveDirectoryW(root.c_str()));
+    g_logPath.clear();
+}
+
 int main() {
     SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
+    CheckLogRotation();
     CheckCore();
     CheckUnsupportedFireflyFallback();
     CheckRepeatedRegularBones();
@@ -448,6 +508,6 @@ int main() {
     assert(HS_ReadStats(stats,5)==1 && stats[0]==0 && stats[1]==0);
     assert(HS_ReadStats(stats,4)==0);
     assert(HS_Initialize()==0 && !strcmp(HS_LastError(),"unsupported_executable"));
-    puts("PASS: interpolation, unsupported group fallback, cached local trajectories and mutation/epoch/eviction, original frame identity/index, source immutability, four-site publication, relays, unwind, stats and executable rejection");
+    puts("PASS: per-process log reuse/rotation/scope/failure, interpolation, unsupported group fallback, cached local trajectories and mutation/epoch/eviction, original frame identity/index, source immutability, four-site publication, relays, unwind, stats and executable rejection");
     return 0;
 }

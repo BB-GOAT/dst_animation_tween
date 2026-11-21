@@ -54,7 +54,64 @@ bool Fail(const char* error) {
     return false;
 }
 
+// 只轮换本模组生成的会话日志，以及升级前的固定文件名。
+bool IsSessionLog(const std::wstring& name) {
+    if (name == L"animation_tween.log") return true;
+    const bool shortName = name.size() == 33;
+    if ((!shortName && name.size() < 41) || name.compare(0, 16, L"animation_tween-") ||
+        name.compare(name.size() - 4, 4, L".log")) return false;
+    for (size_t i = 16; i < name.size() - 4; ++i) {
+        if (i == 24 || (!shortName && (i == 31 || i == 35))) {
+            if (name[i] != L'-') return false;
+        } else if (name[i] < L'0' || name[i] > L'9') return false;
+    }
+    return true;
+}
+
+bool PrepareSessionLog(const std::wstring& directory) {
+    if (!CreateDirectoryW(directory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+    FILETIME created{}, exit{}, kernel{}, user{};
+    SYSTEMTIME utc{}, local{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exit, &kernel, &user) ||
+        !FileTimeToSystemTime(&created, &utc) ||
+        !SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local)) return false;
+    wchar_t name[128]{};
+    swprintf_s(name, L"animation_tween-%04u%02u%02u-%02u%02u.log",
+        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute);
+    // 文件名精确到分钟；同一分钟重新启动时追加到同名日志。
+    const auto current = directory + L"\\" + name;
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, current.c_str(), L"ab") || !file) return false;
+    fclose(file);
+    g_logPath = current;
+
+    // 创建成功后才清理历史文件；虚拟机重建不会重复创建或扫描。
+    std::vector<std::wstring> logs;
+    WIN32_FIND_DATAW item{};
+    HANDLE search = FindFirstFileW((directory + L"\\*").c_str(), &item);
+    if (search == INVALID_HANDLE_VALUE) return true;
+    do {
+        if (!(item.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+            IsSessionLog(item.cFileName)) logs.emplace_back(item.cFileName);
+    } while (FindNextFileW(search, &item));
+    FindClose(search);
+    std::sort(logs.begin(), logs.end(), [](const auto& a, const auto& b) {
+        if (a == L"animation_tween.log") return b != a;
+        if (b == L"animation_tween.log") return false;
+        return a < b;
+    });
+    size_t remaining = logs.size();
+    for (const auto& old : logs) {
+        if (remaining <= 10) break;
+        const auto path = directory + L"\\" + old;
+        if (path != current && DeleteFileW(path.c_str())) --remaining;
+    }
+    if (remaining > 10) Log("log_rotation_incomplete retained=%zu limit=10", remaining);
+    return true;
+}
+
 bool PrepareLog() {
+    if (!g_logPath.empty()) return true;
     HMODULE self = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         reinterpret_cast<LPCWSTR>(&PrepareLog), &self)) return false;
@@ -65,13 +122,7 @@ bool PrepareLog() {
     auto slash = root.find_last_of(L"\\/");
     if (slash == std::wstring::npos) return false;
     root.resize(slash); // DLL 位于模组根目录，日志直接写入其 logs 子目录。
-    root += L"\\logs";
-    if (!CreateDirectoryW(root.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
-    g_logPath = root + L"\\animation_tween.log";
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, g_logPath.c_str(), L"ab") || !file) return false;
-    fclose(file);
-    return true;
+    return PrepareSessionLog(root + L"\\logs");
 }
 
 bool GetTextSection(uint8_t*& start, size_t& size) {

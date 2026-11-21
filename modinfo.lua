@@ -1,8 +1,8 @@
-name = "动画补帧"
+name = "DST动画补帧"
 description = [[
-为主世界、附着动画及 UI 提供动画补帧，需要 Windows x64 LuaJIT FFI。
-本模组不解锁帧率，请在现有 LuaJIT 补丁中设置帧率。
-启用、停用随游戏重载生效；原生文件更新后，完全退出游戏再启动以加载新版。
+给游戏动画补帧，需要 Windows x64 LuaJIT FFI
+本模组不解锁帧率，请在 LuaJIT 模组中设置帧率
+模组更新后，请重启游戏以加载新版文件
 ]]
 author = "冰冰羊"
 version = "0.1.4"

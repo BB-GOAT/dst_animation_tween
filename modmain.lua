@@ -138,7 +138,7 @@ if version ~= "0.1.4" then
 end
 if native.HS_Initialize() ~= 1 then
     G.print(prefix .. "原生初始化已跳过：" .. ffi.string(native.HS_LastError())
-        .. "；详情见模组 logs/animation_tween.log。")
+        .. "；详情见模组 logs 目录中的本轮日志。")
     return
 end
 
