@@ -12,6 +12,12 @@
 #include <vector>
 #include <array>
 #include <initializer_list>
+#include <emmintrin.h>
+#include <list>
+#include <iterator>
+#include <unordered_map>
+#include <memory>
+#include <algorithm>
 
 namespace {
 using AnimGetFrame_t = const void* (*)(const void*, int32_t, float);
@@ -340,7 +346,7 @@ bool Publish(std::array<Hook, 3>& hooks, FrameIdentityHook* identity = nullptr) 
 
 bool Initialize() {
     if (!PrepareLog()) return Fail("log_open_failed");
-    Log("initialize version=0.1.3");
+    Log("initialize version=0.1.4");
     wchar_t executable[32768]{};
     const DWORD count = GetModuleFileNameW(nullptr, executable, 32768);
     if (!count || count >= 32768) return Fail("exe_path_failed");
@@ -404,7 +410,7 @@ bool Initialize() {
 } // namespace
 
 #define HS_EXPORT extern "C" __declspec(dllexport)
-HS_EXPORT const char* HS_Version() { return "0.1.3"; }
+HS_EXPORT const char* HS_Version() { return "0.1.4"; }
 HS_EXPORT const char* HS_LastError() { return g_lastError; }
 HS_EXPORT int HS_Initialize() {
     AcquireSRWLockExclusive(&g_initLock);
@@ -416,7 +422,8 @@ HS_EXPORT int HS_Initialize() {
 }
 HS_EXPORT int HS_SetEnabled(int enabled) {
     if (!g_installed) return 0;
-    InterlockedExchange(&g_skeletalTweenEnabled, enabled ? 1 : 0);
+    const LONG before = InterlockedExchange(&g_skeletalTweenEnabled, enabled ? 1 : 0);
+    if (before != (enabled ? 1 : 0)) InvalidatePlans();
     Log("set_enabled value=%d", enabled ? 1 : 0);
     return 1;
 }

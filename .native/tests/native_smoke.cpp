@@ -66,9 +66,9 @@ void CheckCore() {
     forcedOriginal = nullptr;
 }
 
-void CheckFireflyFallback() {
+void CheckUnsupportedFireflyFallback() {
     // 萤火虫新增光点后，同层同符号的数组下标会平移；贴图帧号也不是实例身份。
-    AnimElement first[2]{}, second[3]{};
+    AnimElement first[8]{}, second[9]{};
     for (auto* element : {&first[0], &first[1], &second[0], &second[1], &second[2]}) {
         element->layer_hash = 434069731;
         element->symbol_hash = 979885181;
@@ -95,7 +95,7 @@ void CheckFireflyFallback() {
     InterlockedExchange(&g_skeletalTweenEnabled, 1);
     const LONG64 interpolatedBefore = g_animInterpFrames;
     // 覆盖新增、消失、同数换序，以及仅一侧有重复身份。
-    const uint32_t counts[][2] = {{2,3},{2,1},{1,3},{2,2}};
+    const uint32_t counts[][2] = {{8,9},{8,1},{1,9},{8,8}};
     uintptr_t key = 0x2000;
     for (const auto& count : counts) {
         frames[0].num_elements = count[0];
@@ -177,6 +177,123 @@ void CheckRepeatedRegularBones() {
     assert(g_animElemsTweened == before + 2);
     forcedOriginal = nullptr;
     InterlockedExchange(&g_skeletalTweenEnabled, 0);
+}
+
+
+void CheckLocalPlans() {
+    AnimElement elements[3][3]{};
+    AnimFrame frames[3]{};
+    const float positions[3][3] = {{-3,3,0},{-1,1,0},{1,-1,0}};
+    for (unsigned f=0; f<3; ++f) {
+        frames[f].elements=elements[f]; frames[f].num_elements=2;
+        for (unsigned i=0; i<3; ++i) {
+            auto& e=elements[f][i]; e.layer_hash=kFireflyLayer; e.symbol_hash=kFireflySymbol;
+            e.m[0]=e.m[3]=FloatToHalf(1); e.m[4]=FloatToHalf(positions[f][i]);
+        }
+    }
+    // 两个光点交叉时保留速度方向；仅按最近距离会对调实例。
+    auto mapping=BuildLocalCorrespondence(frames[0],frames[1],frames[2]);
+    assert((mapping==std::vector<int>{0,1}));
+    Animation animation{}; animation.frames=frames; animation.num_frames=3; animation.framerate=30;
+    InvalidatePlans();
+    const auto* plan=LookupPair(&animation,1,frames[0],frames[1],frames[2]);
+    assert(plan && plan->trajectory && !plan->bypass && plan->tweened==2);
+    uint64_t builds=g_pairCache.builds;
+    assert(LookupPair(&animation,1,frames[0],frames[1],frames[2])==plan);
+    assert(g_pairCache.builds==builds);
+    // 同地址、同元素数量，前一帧的内容改变也必须重建。
+    elements[0][0].m[4]=FloatToHalf(-1); elements[0][1].m[4]=FloatToHalf(1);
+    plan=LookupPair(&animation,1,frames[0],frames[1],frames[2]);
+    assert(g_pairCache.builds==++builds);
+    mapping=BuildLocalCorrespondence(frames[0],frames[1],frames[2]);
+    assert((mapping==std::vector<int>{1,0}));
+    // 同地址原地修改下一帧、meta指针或元素数量，不能沿用旧输入。
+    elements[2][0].m[4]=FloatToHalf(4);
+    assert(LookupPair(&animation,1,frames[0],frames[1],frames[2]));
+    assert(g_pairCache.builds==++builds);
+    elements[1][0].meta0[4]^=1;
+    assert(LookupPair(&animation,1,frames[0],frames[1],frames[2]));
+    assert(g_pairCache.builds==++builds);
+    frames[2].num_elements=3;
+    assert(LookupPair(&animation,1,frames[0],frames[1],frames[2]));
+    assert(g_pairCache.builds==++builds);
+    InvalidatePlans();
+    assert(LookupPair(&animation,1,frames[0],frames[1],frames[2]));
+    assert(g_pairCache.builds==++builds && g_pairCache.entries.size()==1);
+    // 出生点插回目标顺序，且零缩放端点不引用旧快照中的meta。
+    const float birthPositions[3][3]={{-100,0,0},{-98,2,0},{-96,100,4}};
+    for (unsigned f=0;f<3;++f) for(unsigned i=0;i<3;++i) elements[f][i].m[4]=FloatToHalf(birthPositions[f][i]);
+    plan=LookupPair(&animation,1,frames[0],frames[1],frames[2]);
+    assert(plan->matrices.size()==3 && plan->sources[1].target && plan->sources[1].index==1);
+    uint16_t out[6]{};
+    ApplyMatrix(plan->matrices[1],0,out);assert(HalfToFloat(out[0])==0);
+    ApplyMatrix(plan->matrices[1],1,out);assert(HalfToFloat(out[0])==1);
+    // 预算淘汰只影响命中率，不改变结果；每个键均可重新计算。
+    for(uint32_t i=0;i<kPlanEntryLimit+2;++i) assert(LookupPair(&animation,i,frames[0],frames[1],frames[2]));
+    assert(g_pairCache.entries.size()<=kPlanEntryLimit && g_pairCache.bytes<=kPlanBudget);
+    assert(LookupPair(&animation,1,frames[0],frames[1],frames[2])->sources[1].target);
+    // 大帧对覆盖字节预算，不能只验证条目数限制。
+    std::vector<AnimElement> large0(512),large1(512);
+    for(unsigned i=0;i<512;++i) {
+        large0[i].layer_hash=large1[i].layer_hash=i+1;
+        large0[i].symbol_hash=large1[i].symbol_hash=2;
+        large0[i].m[0]=large0[i].m[3]=large1[i].m[0]=large1[i].m[3]=FloatToHalf(1);
+        large1[i].m[4]=FloatToHalf(2);
+    }
+    AnimFrame a{},b{};a.elements=large0.data();b.elements=large1.data();a.num_elements=b.num_elements=512;
+    g_pairCache.Clear();
+    for(uint32_t i=0;i<300;++i) {
+        const auto* large=LookupPair(&animation,i,a,a,b);
+        assert(large && large->tweened==512 && g_pairCache.bytes<=kPlanBudget);
+    }
+    assert(g_pairCache.entries.size()<300);
+    InvalidatePlans();
+}
+
+void CheckFireflyInterpolation() {
+    AnimElement elements[3][3]{};
+    AnimFrame frames[3]{};
+    const float positions[3][3] = {{-100,0,0},{-98,2,0},{-96,100,4}};
+    for(unsigned f=0;f<3;++f) {
+        frames[f].elements=elements[f]; frames[f].num_elements=f==2?3:2;
+        for(unsigned i=0;i<3;++i) {
+            auto& e=elements[f][i]; e.layer_hash=kFireflyLayer; e.symbol_hash=kFireflySymbol;
+            e.m[0]=e.m[3]=FloatToHalf(1);e.m[4]=FloatToHalf(positions[f][i]);
+            e.meta0[4]=static_cast<uint8_t>(f*10+i);
+        }
+    }
+    AnimElement original[3][3];memcpy(original,elements,sizeof(original));
+    Animation animation{};animation.frames=frames;animation.num_frames=3;animation.framerate=30;
+    forcedOriginal=&frames[2];
+    InterlockedExchange(&g_skeletalTweenEnabled,1);InvalidatePlans();
+    constexpr uintptr_t key=0x9000;
+    InterpGetFrameCore(&animation,1,0,key,true);
+    LARGE_INTEGER frequency{};QueryPerformanceFrequency(&frequency);
+    for(float phase:{0.0f,.25f,.5f,.75f,1.0f}) {
+        LARGE_INTEGER now{};QueryPerformanceCounter(&now);
+        for(auto& track:g_tlsAnimState->tracks) if(track.valid && track.entity_key==key) {
+            track.last_time=2.f/30;track.prev_f=1;track.curr_f=2;track.tick_period=1;
+            track.tick_qpc=now.QuadPart-static_cast<int64_t>(frequency.QuadPart*phase);
+        }
+        const auto* result=static_cast<const AnimFrame*>(InterpGetFrameCore(&animation,1,2.f/30,key,true));
+        if(phase==0) {assert(result==&frames[1]);continue;}
+        if(phase==1) {assert(result==&frames[2]);continue;}
+        assert(result->num_elements==3 && ResolveFrameIdentity(result)==&frames[2]);
+        assert(fabsf(HalfToFloat(result->elements[0].m[4])-(-98+2*phase))<.1f);
+        assert(fabsf(HalfToFloat(result->elements[2].m[4])-(2+2*phase))<.1f);
+        assert(HalfToFloat(result->elements[1].m[4])==100);
+        assert(fabsf(HalfToFloat(result->elements[1].m[0])-phase)<.001f);
+        assert(result->elements[0].meta0[4]==10 && result->elements[1].meta0[4]==21);
+    }
+    assert(!memcmp(original,elements,sizeof(original)));
+    // 零元素一端仍能处理光点出生/消失；不能当成普通空帧提前退出。
+    frames[0].num_elements=0;frames[1].num_elements=0;
+    const auto* born=LookupPair(&animation,1,frames[0],frames[1],frames[2]);
+    assert(born->trajectory && born->matrices.size()==3 && born->tweened==3);
+    const auto* dying=LookupPair(&animation,2,frames[1],frames[2],frames[0]);
+    assert(dying->trajectory && dying->matrices.size()==3 && dying->tweened==3);
+    forcedOriginal=nullptr;
+    InterlockedExchange(&g_skeletalTweenEnabled,0);InvalidatePlans();
 }
 
 // 生成小型 x64 调用夹具，检验 Main 的 [rbx+8] 和另外两路的 rbx 协议。
@@ -319,15 +436,18 @@ void CheckIdentityRegisters() {
 }
 
 int main() {
+    SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
     CheckCore();
-    CheckFireflyFallback();
+    CheckUnsupportedFireflyFallback();
     CheckRepeatedRegularBones();
+    CheckLocalPlans();
+    CheckFireflyInterpolation();
     CheckPublish();
     CheckIdentityRegisters();
     uint64_t stats[5]{};
     assert(HS_ReadStats(stats,5)==1 && stats[0]==0 && stats[1]==0);
     assert(HS_ReadStats(stats,4)==0);
     assert(HS_Initialize()==0 && !strcmp(HS_LastError(),"unsupported_executable"));
-    puts("PASS: interpolation, ambiguous identity fallback, original frame identity/index, source immutability, four-site publication, relays, unwind, stats and executable rejection");
+    puts("PASS: interpolation, unsupported group fallback, cached local trajectories and mutation/epoch/eviction, original frame identity/index, source immutability, four-site publication, relays, unwind, stats and executable rejection");
     return 0;
 }

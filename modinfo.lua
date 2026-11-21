@@ -5,7 +5,7 @@ description = [[
 启用、停用随游戏重载生效；原生文件更新后，完全退出游戏再启动以加载新版。
 ]]
 author = "冰冰羊"
-version = "0.1.3"
+version = "0.1.4"
 api_version = 10
 dst_compatible = true
 client_only_mod = true

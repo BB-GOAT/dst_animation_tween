@@ -137,6 +137,7 @@ struct ThreadLocalAnimState {
     AnimBufferSlot slots[4];
     uint32_t ring = 0;
     std::vector<EntityAnimTrack> tracks;
+    LONG64 epoch = 0;
     ThreadLocalAnimState() : tracks(kTrackSlots) {}
 };
 
@@ -152,20 +153,8 @@ static const AnimFrame* ResolveFrameIdentity(const AnimFrame* frame) noexcept {
     return frame;
 }
 
-static bool HasRepeatedFireflyElements(const AnimFrame& frame) noexcept {
-    // fireflies.zip 的 firefly 符号和 feather 图层；只回退已核实的光点动画。
-    constexpr uint32_t kFireflySymbol = 979885181u;
-    constexpr uint32_t kFireflyLayer = 434069731u;
-    bool found = false;
-    for (uint32_t i = 0; i < frame.num_elements; ++i) {
-        const auto& element = frame.elements[i];
-        if (element.layer_hash == kFireflyLayer && element.symbol_hash == kFireflySymbol) {
-            if (found) return true;
-            found = true;
-        }
-    }
-    return false;
-}
+#include "matrix_plan.inl"
+#include "animation_plan.inl"
 
 static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, float time, uintptr_t key, bool isMainParent) {
     if (!animPtr || !g_origAnimGetFrame) {
@@ -178,12 +167,19 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     const auto* anim = static_cast<const Animation*>(animPtr);
     uint32_t nframes = anim->num_frames;
     float fps = anim->framerate;
-    if (nframes <= 1 || !anim->frames || fps <= 0.0f || fps > 240.0f) {
+    if (nframes <= 1 || !anim->frames || !std::isfinite(fps) || !std::isfinite(time) || fps <= 0.0f || fps > 240.0f) {
         return g_origAnimGetFrame(animPtr, playMode, time);
     }
 
     thread_local ThreadLocalAnimState tls;
     g_tlsAnimState = &tls;
+    // 新VM重新启用或手动切换后，不复用上一代实体地址对应的播放历史。
+    const LONG64 epoch = InterlockedCompareExchange64(&g_planEpoch, 0, 0);
+    if (tls.epoch != epoch) {
+        for (auto& track : tls.tracks) track = {};
+        tls.epoch = epoch;
+        g_tlsLastParentKey = 0;
+    }
     if (isMainParent && key != 0) {
         g_tlsLastParentKey = key;
     }
@@ -307,21 +303,24 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     const AnimFrame& f0 = anim->frames[idx0];
     const AnimFrame& f1 = anim->frames[idx1];
     uint32_t n0 = f0.num_elements, n1 = f1.num_elements;
-    if (n0 > 512 || n1 > 512) return g_origAnimGetFrame(animPtr, playMode, time);
+    if (n0 > 512 || n1 > 512 || (n0 && !f0.elements) || (n1 && !f1.elements)) return g_origAnimGetFrame(animPtr, playMode, time);
 
-    // 萤火虫新增、消失时不能按出现次数猜配对，保留游戏原始结果及播放时间。
-    // 人物双腿、双脚等也有合法的重复身份，不能把此回退推广到所有同名部件。
-    // 检查早于端点快捷返回，避免同一 tick 先显示旧端点、随后跳回原版当前帧。
-    if ((f0.elements && HasRepeatedFireflyElements(f0)) || (f1.elements && HasRepeatedFireflyElements(f1))) {
-        return g_origAnimGetFrame(animPtr, playMode, time);
-    }
+    // 只读取本次调用仍有效的资源；缓存中的旧地址从不用于读取。
+    const AnimFrame& previous = anim->frames[idx0 ? idx0 - 1 : 0];
+    const PairPlan* prepared = nullptr;
+    try { prepared = LookupPair(anim, idx0, previous, f0, f1, epoch); }
+    catch (...) { return g_origAnimGetFrame(animPtr, playMode, time); }
+    if (!prepared) return g_origAnimGetFrame(animPtr, playMode, time);
+    const auto& plan = *prepared;
+    if (plan.bypass) return g_origAnimGetFrame(animPtr, playMode, time);
 
     if (frac <= 0.015f) return &f0;
     if (frac >= 0.985f) return &f1;
-    if (n0 == 0 || !f0.elements || n1 == 0 || !f1.elements) return &f0;
+    if (plan.matrices.empty()) return &f0;
 
     AnimBufferSlot& bufSlot = tls.slots[(tls.ring++) & 3];
-    if (bufSlot.elems.size() < n0) bufSlot.elems.resize(n0);
+    const uint32_t outputCount = static_cast<uint32_t>(plan.matrices.size());
+    if (bufSlot.elems.size() < outputCount) bufSlot.elems.resize(outputCount);
 
     // 使用游戏自己的取帧结果保留当前播放时间的帧身份，而非猜测索引。
     bufSlot.original = static_cast<const AnimFrame*>(g_origAnimGetFrame(animPtr, playMode, time));
@@ -329,75 +328,25 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
 
     bufSlot.frame = f0;
     bufSlot.frame.elements = bufSlot.elems.data();
-    memcpy(bufSlot.elems.data(), f0.elements, n0 * sizeof(AnimElement));
-
-    uint32_t tweenedCount = 0;
-    uint32_t pass2Count = 0;
-    for (uint32_t i = 0; i < n0; ++i) {
-        const AnimElement& e0 = f0.elements[i];
-        uint32_t lhash = e0.layer_hash, shash = e0.symbol_hash, fnum = e0.frame_num;
-
-        // Pass 1: exact (layer_hash, symbol_hash, frame_num) occurrence-indexed match
-        uint32_t occExact = 0;
-        for (uint32_t k = 0; k < i; ++k) {
-            const AnimElement& ek = f0.elements[k];
-            if (ek.symbol_hash == shash && ek.layer_hash == lhash && ek.frame_num == fnum) ++occExact;
-        }
-
-        const AnimElement* match = nullptr;
-        bool isPass2 = false;
-        if (occExact == 0 && i < n1) {
-            const AnimElement& cand = f1.elements[i];
-            if (cand.symbol_hash == shash && cand.layer_hash == lhash && cand.frame_num == fnum) {
-                bool earlier = false;
-                for (uint32_t j = 0; j < i; ++j) {
-                    const AnimElement& ej = f1.elements[j];
-                    if (ej.symbol_hash == shash && ej.layer_hash == lhash && ej.frame_num == fnum) {
-                        earlier = true; break;
-                    }
-                }
-                if (!earlier) match = &cand;
-            }
-        }
-        if (!match) {
-            uint32_t seen = 0;
-            for (uint32_t j = 0; j < n1; ++j) {
-                const AnimElement& e1 = f1.elements[j];
-                if (e1.symbol_hash == shash && e1.layer_hash == lhash && e1.frame_num == fnum) {
-                    if (seen == occExact) { match = &e1; break; }
-                    ++seen;
-                }
-            }
-        }
-
-        // Pass 2: fallback for hand-drawn sprite-frame swaps (hands, weapons, boss claws)
-        // Match same (layer_hash, symbol_hash), interpolate matrix smoothly, flip sprite at frac >= 0.5
-        if (!match) {
-            uint32_t occLS = 0;
-            for (uint32_t k = 0; k < i; ++k) {
-                const AnimElement& ek = f0.elements[k];
-                if (ek.symbol_hash == shash && ek.layer_hash == lhash) ++occLS;
-            }
-            uint32_t seen = 0;
-            for (uint32_t j = 0; j < n1; ++j) {
-                const AnimElement& e1 = f1.elements[j];
-                if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
-                    if (seen == occLS) { match = &e1; isPass2 = true; break; }
-                    ++seen;
-                }
-            }
-        }
-
-        if (match && TweenElementMatrix(e0.m, match->m, frac, bufSlot.elems[i].m)) {
-            ++tweenedCount;
-            if (isPass2) {
-                ++pass2Count;
-                if (frac >= 0.5f) {
-                    bufSlot.elems[i].frame_num = match->frame_num;
-                }
-            }
+    bufSlot.frame.num_elements = outputCount;
+    // meta 中含有引擎字符串缓存指针，输出必须从本次有效输入复制。
+    if (!plan.trajectory) {
+        memcpy(bufSlot.elems.data(), f0.elements, outputCount * sizeof(AnimElement));
+    } else {
+        for (uint32_t i = 0; i < outputCount; ++i) {
+            const auto& ref = plan.sources[i];
+            bufSlot.elems[i] = ref.target ? f1.elements[ref.index] : f0.elements[ref.index];
         }
     }
+
+    for (uint32_t i = 0; i < outputCount; ++i) {
+        if (plan.matrices[i].mode) ApplyMatrix(plan.matrices[i], frac, bufSlot.elems[i].m);
+        if (plan.swaps[i] && frac >= 0.5f && plan.matrices[i].mode) {
+            bufSlot.elems[i].frame_num = plan.targetSprite[i];
+        }
+    }
+    const auto tweenedCount = plan.tweened;
+    const auto pass2Count = plan.pass2;
 
     if (tweenedCount > 0) {
         InterlockedIncrement64(&g_animInterpFrames);
