@@ -132,7 +132,7 @@ if not loaded then
     return
 end
 local version = ffi.string(native.HS_Version())
-if version ~= "0.1.1" then
+if version ~= "0.1.3" then
     G.print(prefix .. "DLL 版本不匹配，请完全退出游戏后重新构建或更新。")
     return
 end

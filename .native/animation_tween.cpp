@@ -340,7 +340,7 @@ bool Publish(std::array<Hook, 3>& hooks, FrameIdentityHook* identity = nullptr) 
 
 bool Initialize() {
     if (!PrepareLog()) return Fail("log_open_failed");
-    Log("initialize version=0.1.1");
+    Log("initialize version=0.1.3");
     wchar_t executable[32768]{};
     const DWORD count = GetModuleFileNameW(nullptr, executable, 32768);
     if (!count || count >= 32768) return Fail("exe_path_failed");
@@ -404,7 +404,7 @@ bool Initialize() {
 } // namespace
 
 #define HS_EXPORT extern "C" __declspec(dllexport)
-HS_EXPORT const char* HS_Version() { return "0.1.1"; }
+HS_EXPORT const char* HS_Version() { return "0.1.3"; }
 HS_EXPORT const char* HS_LastError() { return g_lastError; }
 HS_EXPORT int HS_Initialize() {
     AcquireSRWLockExclusive(&g_initLock);

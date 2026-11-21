@@ -66,6 +66,119 @@ void CheckCore() {
     forcedOriginal = nullptr;
 }
 
+void CheckFireflyFallback() {
+    // 萤火虫新增光点后，同层同符号的数组下标会平移；贴图帧号也不是实例身份。
+    AnimElement first[2]{}, second[3]{};
+    for (auto* element : {&first[0], &first[1], &second[0], &second[1], &second[2]}) {
+        element->layer_hash = 434069731;
+        element->symbol_hash = 979885181;
+        element->m[0] = element->m[3] = FloatToHalf(1.0f);
+    }
+    first[0].frame_num = 0;
+    first[1].frame_num = 1;
+    second[0].frame_num = 1;
+    second[1].frame_num = 0;
+    second[2].frame_num = 2;
+    first[0].m[4] = FloatToHalf(-81.25f);
+    first[1].m[4] = FloatToHalf(99.1f);
+    second[0].m[4] = FloatToHalf(107.7f);
+    second[1].m[4] = FloatToHalf(-80.35f);
+    second[2].m[4] = FloatToHalf(92.5f);
+    AnimFrame frames[2]{};
+    frames[0].elements = first;
+    frames[1].elements = second;
+    Animation animation{};
+    animation.frames = frames;
+    animation.num_frames = 2;
+    animation.framerate = 30.0f;
+    forcedOriginal = &frames[1];
+    InterlockedExchange(&g_skeletalTweenEnabled, 1);
+    const LONG64 interpolatedBefore = g_animInterpFrames;
+    // 覆盖新增、消失、同数换序，以及仅一侧有重复身份。
+    const uint32_t counts[][2] = {{2,3},{2,1},{1,3},{2,2}};
+    uintptr_t key = 0x2000;
+    for (const auto& count : counts) {
+        frames[0].num_elements = count[0];
+        frames[1].num_elements = count[1];
+        InterpGetFrameCore(&animation, 1, 0.0f, key, true);
+        InterpGetFrameCore(&animation, 1, 1.0f / 30.0f, key, true);
+        for (float phase : {0.0f, 0.005f, 0.5f, 0.995f, 1.0f}) {
+            LARGE_INTEGER now{}, frequency{};
+            QueryPerformanceCounter(&now);
+            QueryPerformanceFrequency(&frequency);
+            for (auto& track : g_tlsAnimState->tracks) {
+                if (track.valid && track.entity_key == key) {
+                    track.tick_period = 1.0f;
+                    track.tick_qpc = now.QuadPart - static_cast<int64_t>(frequency.QuadPart * static_cast<double>(phase));
+                }
+            }
+            const auto* result = static_cast<const AnimFrame*>(InterpGetFrameCore(&animation, 1, 1.0f / 30.0f, key, true));
+            assert(result == forcedOriginal);
+            assert(ResolveFrameIdentity(result) == forcedOriginal);
+            assert(result->elements == second);
+        }
+        key += 0x100;
+    }
+    assert(g_animInterpFrames == interpolatedBefore);
+    assert(HalfToFloat(first[0].m[4]) == -81.25f);
+    assert(HalfToFloat(second[1].m[4]) == -80.375f);
+    // 符号相同但层不同，或层相同但符号不同，仍具有唯一身份。
+    frames[0].num_elements = 2;
+    first[1].layer_hash += 1;
+    assert(!HasRepeatedFireflyElements(frames[0]));
+    first[1].layer_hash = first[0].layer_hash;
+    first[1].symbol_hash += 1;
+    assert(!HasRepeatedFireflyElements(frames[0]));
+    forcedOriginal = nullptr;
+    InterlockedExchange(&g_skeletalTweenEnabled, 0);
+}
+
+void CheckRepeatedRegularBones() {
+    // 人物双腿等合法的重复部件必须继续补帧，不能整帧回退。
+    AnimElement elements[2][2]{};
+    AnimFrame frames[2]{};
+    for (unsigned f = 0; f < 2; ++f) {
+        frames[f].elements = elements[f];
+        frames[f].num_elements = 2;
+        for (unsigned i = 0; i < 2; ++i) {
+            auto& element = elements[f][i];
+            element.layer_hash = 1;
+            element.symbol_hash = 2;
+            element.frame_num = 3;
+            element.m[0] = element.m[3] = FloatToHalf(1.0f);
+            element.m[4] = FloatToHalf(i * 100.0f + f * 32.0f);
+        }
+        assert(!HasRepeatedFireflyElements(frames[f]));
+    }
+    Animation animation{};
+    animation.frames = frames;
+    animation.num_frames = 2;
+    animation.framerate = 30.0f;
+    forcedOriginal = &frames[1];
+    InterlockedExchange(&g_skeletalTweenEnabled, 1);
+    const LONG64 before = g_animElemsTweened;
+    constexpr uintptr_t key = 0x4000;
+    InterpGetFrameCore(&animation, 1, 0.0f, key, true);
+    InterpGetFrameCore(&animation, 1, 1.0f / 30.0f, key, true);
+    LARGE_INTEGER now{}, frequency{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    for (auto& track : g_tlsAnimState->tracks) {
+        if (track.valid && track.entity_key == key) {
+            track.tick_period = 1.0f;
+            track.tick_qpc = now.QuadPart - frequency.QuadPart / 2;
+        }
+    }
+    const auto* result = static_cast<const AnimFrame*>(InterpGetFrameCore(&animation, 1, 1.0f / 30.0f, key, true));
+    assert(result != &frames[0] && result != &frames[1]);
+    assert(ResolveFrameIdentity(result) == &frames[1]);
+    assert(fabsf(HalfToFloat(result->elements[0].m[4]) - 16.0f) < 0.1f);
+    assert(fabsf(HalfToFloat(result->elements[1].m[4]) - 116.0f) < 0.1f);
+    assert(g_animElemsTweened == before + 2);
+    forcedOriginal = nullptr;
+    InterlockedExchange(&g_skeletalTweenEnabled, 0);
+}
+
 // 生成小型 x64 调用夹具，检验 Main 的 [rbx+8] 和另外两路的 rbx 协议。
 uintptr_t captured = 0;
 const void* Capture(const void*,int32_t,float,const void* key) {
@@ -207,11 +320,14 @@ void CheckIdentityRegisters() {
 
 int main() {
     CheckCore();
+    CheckFireflyFallback();
+    CheckRepeatedRegularBones();
     CheckPublish();
     CheckIdentityRegisters();
     uint64_t stats[5]{};
     assert(HS_ReadStats(stats,5)==1 && stats[0]==0 && stats[1]==0);
     assert(HS_ReadStats(stats,4)==0);
     assert(HS_Initialize()==0 && !strcmp(HS_LastError(),"unsupported_executable"));
-    puts("PASS: interpolation, original frame identity/index, source immutability, four-site publication, relays, unwind, stats and executable rejection");
+    puts("PASS: interpolation, ambiguous identity fallback, original frame identity/index, source immutability, four-site publication, relays, unwind, stats and executable rejection");
+    return 0;
 }

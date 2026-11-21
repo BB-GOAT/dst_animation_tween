@@ -152,6 +152,21 @@ static const AnimFrame* ResolveFrameIdentity(const AnimFrame* frame) noexcept {
     return frame;
 }
 
+static bool HasRepeatedFireflyElements(const AnimFrame& frame) noexcept {
+    // fireflies.zip 的 firefly 符号和 feather 图层；只回退已核实的光点动画。
+    constexpr uint32_t kFireflySymbol = 979885181u;
+    constexpr uint32_t kFireflyLayer = 434069731u;
+    bool found = false;
+    for (uint32_t i = 0; i < frame.num_elements; ++i) {
+        const auto& element = frame.elements[i];
+        if (element.layer_hash == kFireflyLayer && element.symbol_hash == kFireflySymbol) {
+            if (found) return true;
+            found = true;
+        }
+    }
+    return false;
+}
+
 static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, float time, uintptr_t key, bool isMainParent) {
     if (!animPtr || !g_origAnimGetFrame) {
         return g_origAnimGetFrame ? g_origAnimGetFrame(animPtr, playMode, time) : nullptr;
@@ -285,8 +300,6 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         frac = fNow - fl;
     }
 
-    if (frac <= 0.015f) return &anim->frames[idx0];
-    if (frac >= 0.985f) return &anim->frames[idx1];
     if (idx0 == idx1 || idx0 >= nframes || idx1 >= nframes) {
         return &anim->frames[idx0 < nframes ? idx0 : 0];
     }
@@ -294,7 +307,18 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     const AnimFrame& f0 = anim->frames[idx0];
     const AnimFrame& f1 = anim->frames[idx1];
     uint32_t n0 = f0.num_elements, n1 = f1.num_elements;
-    if (n0 == 0 || !f0.elements || n1 == 0 || !f1.elements || n0 > 512) return &f0;
+    if (n0 > 512 || n1 > 512) return g_origAnimGetFrame(animPtr, playMode, time);
+
+    // 萤火虫新增、消失时不能按出现次数猜配对，保留游戏原始结果及播放时间。
+    // 人物双腿、双脚等也有合法的重复身份，不能把此回退推广到所有同名部件。
+    // 检查早于端点快捷返回，避免同一 tick 先显示旧端点、随后跳回原版当前帧。
+    if ((f0.elements && HasRepeatedFireflyElements(f0)) || (f1.elements && HasRepeatedFireflyElements(f1))) {
+        return g_origAnimGetFrame(animPtr, playMode, time);
+    }
+
+    if (frac <= 0.015f) return &f0;
+    if (frac >= 0.985f) return &f1;
+    if (n0 == 0 || !f0.elements || n1 == 0 || !f1.elements) return &f0;
 
     AnimBufferSlot& bufSlot = tls.slots[(tls.ring++) & 3];
     if (bufSlot.elems.size() < n0) bufSlot.elems.resize(n0);
