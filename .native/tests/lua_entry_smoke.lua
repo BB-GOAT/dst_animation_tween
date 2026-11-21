@@ -67,7 +67,7 @@ end
 for _, label in ipairs({"dedicated","no_ffi","linux","32bit","missing_pkg"}) do run(label) end
 local count, enabled = 0
 local native = {
-    HS_Version = function() return "0.1.0" end,
+    HS_Version = function() return "0.1.1" end,
     HS_LastError = function() return "signature_not_unique_or_missing" end,
     HS_Initialize = function() count=count+1; return 1 end,
     HS_SetEnabled = function(value) enabled=value; return 1 end,

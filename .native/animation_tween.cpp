@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <initializer_list>
 
 namespace {
 using AnimGetFrame_t = const void* (*)(const void*, int32_t, float);
@@ -122,14 +123,14 @@ bool FindUnique(Hook& hook, uint8_t* start, size_t size) {
     return matches == 1;
 }
 
-uint8_t* AllocNearExecutable(uint8_t* nearAddress) {
+uint8_t* AllocNearExecutable(uint8_t* nearAddress, size_t size = 64) {
     const uintptr_t base = reinterpret_cast<uintptr_t>(nearAddress) & ~uintptr_t(0xFFFF);
     for (uintptr_t delta = 0x10000; delta < 0x60000000; delta += 0x10000) {
         if (base > delta) {
-            void* p = VirtualAlloc(reinterpret_cast<void*>(base - delta), 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            void* p = VirtualAlloc(reinterpret_cast<void*>(base - delta), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (p) return static_cast<uint8_t*>(p);
         }
-        void* p = VirtualAlloc(reinterpret_cast<void*>(base + delta), 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        void* p = VirtualAlloc(reinterpret_cast<void*>(base + delta), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (p) return static_cast<uint8_t*>(p);
     }
     return nullptr;
@@ -156,8 +157,100 @@ bool PrepareStub(Hook& hook) {
         && FlushInstructionCache(GetCurrentProcess(), hook.stub, 64);
 }
 
+struct FrameIdentityHook {
+    uint8_t* site = nullptr;
+    uint8_t* stub = nullptr;
+    RUNTIME_FUNCTION* unwind = nullptr;
+    // 完整替换一条 mov rdx,[rsp+6C8h]；后面的原始除以 40 运算保持不变。
+    std::array<uint8_t, 8> before{{0x48,0x8B,0x94,0x24,0xC8,0x06,0,0}};
+    std::array<uint8_t, 8> after{{0xE8,0,0,0,0,0x0F,0x1F,0}};
+
+    void Release() {
+        if (unwind) RtlDeleteFunctionTable(unwind);
+        if (stub) VirtualFree(stub, 0, MEM_RELEASE);
+        unwind = nullptr;
+        stub = nullptr;
+    }
+};
+
+bool FindFrameIdentitySite(FrameIdentityHook& hook, uint8_t* start, size_t size) {
+    // 覆盖帧指针、原数组基址、除以 sizeof(AnimFrame) 和元数据访问的完整指令链。
+    constexpr uint8_t signature[] = {
+        0x48,0x8B,0x94,0x24,0xC8,0x06,0,0, 0x48,0x8B,0x7D,0x08,
+        0x48,0x2B,0x94,0x24,0x88,0x07,0,0,
+        0x48,0xB8,0x67,0x66,0x66,0x66,0x66,0x66,0x66,0x66,
+        0x48,0xF7,0xEA,0x48,0xC1,0xFA,0x04,0x48,0x8B,0xDA,
+        0x48,0xC1,0xEB,0x3F,0x48,0x03,0xDA,0x8B,0xDB,
+        0x66,0x83,0x7C,0x9F,0x02,0
+    };
+    unsigned matches = 0;
+    for (size_t offset = 0; offset + sizeof(signature) <= size; ++offset) {
+        if (!memcmp(start + offset, signature, sizeof(signature))) {
+            hook.site = start + offset;
+            ++matches;
+        }
+    }
+    Log("signature channel=frame_identity matches=%u site=%p", matches, hook.site);
+    return matches == 1;
+}
+
+bool PrepareFrameIdentityStub(FrameIdentityHook& hook) {
+    hook.stub = AllocNearExecutable(hook.site, 512);
+    if (!hook.stub) return false;
+    std::vector<uint8_t> code;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) { code.insert(code.end(), bytes); };
+    auto imm32 = [&](uint32_t value) {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
+        code.insert(code.end(), bytes, bytes + 4);
+    };
+    // 原位置可调用其他函数，调用前 RSP 对齐到 16；relay 另留影子空间。
+    emit({0x48,0x81,0xEC}); imm32(0xC8);
+    emit({0x48,0x89,0x44,0x24,0x20}); // rax
+    emit({0x48,0x89,0x4C,0x24,0x28}); // rcx
+    for (uint8_t reg = 0; reg < 4; ++reg) {
+        emit({0x4C,0x89,static_cast<uint8_t>(0x44 + reg * 8),0x24,static_cast<uint8_t>(0x30 + reg * 8)});
+    }
+    for (uint8_t reg = 0; reg < 6; ++reg) {
+        emit({0xF3,0x0F,0x7F,static_cast<uint8_t>(0x84 + reg * 8),0x24}); imm32(0x50 + reg * 16);
+    }
+    emit({0x48,0x8B,0x8C,0x24}); imm32(0x798); // 原 RSP+6C8h
+    emit({0x48,0xB8});
+    const auto destination = reinterpret_cast<uintptr_t>(&ResolveFrameIdentity);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&destination);
+    code.insert(code.end(), bytes, bytes + 8);
+    emit({0xFF,0xD0,0x48,0x89,0xC2}); // call rax; mov rdx,rax
+    for (uint8_t reg = 0; reg < 6; ++reg) {
+        emit({0xF3,0x0F,0x6F,static_cast<uint8_t>(0x84 + reg * 8),0x24}); imm32(0x50 + reg * 16);
+    }
+    for (uint8_t reg = 0; reg < 4; ++reg) {
+        emit({0x4C,0x8B,static_cast<uint8_t>(0x44 + reg * 8),0x24,static_cast<uint8_t>(0x30 + reg * 8)});
+    }
+    emit({0x48,0x8B,0x4C,0x24,0x28,0x48,0x8B,0x44,0x24,0x20});
+    emit({0x48,0x81,0xC4}); imm32(0xC8);
+    emit({0xC3});
+    // 下一段原指令在读取标志前执行 sub；这里仅需保持通用/XMM 寄存器。
+    if (code.size() >= 0x1C0) return false;
+    memcpy(hook.stub, code.data(), code.size());
+    // relay 内有 C++ 调用，为 Windows 栈回溯登记实际栈分配。
+    hook.unwind = reinterpret_cast<RUNTIME_FUNCTION*>(hook.stub + 0x1C0);
+    *hook.unwind = {0, static_cast<DWORD>(code.size()), 0x1E0};
+    const uint8_t unwind[] = {1,7,2,0,7,1,0x19,0}; // UWOP_ALLOC_LARGE: 25*8
+    memcpy(hook.stub + 0x1E0, unwind, sizeof(unwind));
+    if (!RtlAddFunctionTable(hook.unwind, 1, reinterpret_cast<DWORD64>(hook.stub))) {
+        hook.unwind = nullptr;
+        return false;
+    }
+    const int64_t delta = reinterpret_cast<intptr_t>(hook.stub) - reinterpret_cast<intptr_t>(hook.site + 5);
+    if (delta < INT32_MIN || delta > INT32_MAX) return false;
+    const int32_t displacement = static_cast<int32_t>(delta);
+    memcpy(hook.after.data() + 1, &displacement, 4);
+    DWORD old = 0;
+    return VirtualProtect(hook.stub, 512, PAGE_EXECUTE_READ, &old)
+        && FlushInstructionCache(GetCurrentProcess(), hook.stub, 512);
+}
+
 // FFI 初始化可能发生在 smooth_loading 正在刷新画面时。
-// 所有分配和日志先完成，只在发布三个 call 位移期间暂停其他现存线程；
+// 所有分配和日志先完成，只在发布三处 call 位移和帧身份修复期间暂停其他现存线程；
 // 暂停区不调用 Lua、日志、堆分配或加载器，失败时恢复原位移并恢复线程。
 class PausedThreads {
     std::vector<HANDLE> handles;
@@ -198,7 +291,13 @@ public:
     }
 };
 
-bool Publish(std::array<Hook, 3>& hooks) {
+bool Publish(std::array<Hook, 3>& hooks, FrameIdentityHook* identity = nullptr) {
+    struct Patch { uint8_t* address; const void* before; const void* after; size_t size; };
+    std::array<Patch, 4> patches{};
+    size_t count = 0;
+    // 身份修复先于取帧重定向安装；同一暂停区内完成并统一回滚。
+    if (identity) patches[count++] = {identity->site, identity->before.data(), identity->after.data(), identity->before.size()};
+    for (auto& h : hooks) patches[count++] = {h.call + 1, &h.before, &h.after, 4};
     bool okay = false;
     {
         PausedThreads threads;
@@ -206,28 +305,32 @@ bool Publish(std::array<Hook, 3>& hooks) {
         for (const auto& h : hooks) {
             if (h.call[0] != 0xE8 || memcmp(h.call + 1, &h.before, 4)) return false;
         }
+        for (size_t i = 0; i < count; ++i) {
+            if (memcmp(patches[i].address, patches[i].before, patches[i].size)) return false;
+        }
         size_t written = 0;
         bool completed = true;
-        for (auto& h : hooks) {
+        for (size_t i = 0; i < count; ++i) {
+            const auto& patch = patches[i];
             DWORD old = 0;
-            if (!VirtualProtect(h.call + 1, 4, PAGE_EXECUTE_READWRITE, &old)) { completed = false; break; }
-            memcpy(h.call + 1, &h.after, 4);
+            if (!VirtualProtect(patch.address, patch.size, PAGE_EXECUTE_READWRITE, &old)) { completed = false; break; }
+            memcpy(patch.address, patch.after, patch.size);
             ++written;
-            const BOOL flushed = FlushInstructionCache(GetCurrentProcess(), h.call, 5);
+            const BOOL flushed = FlushInstructionCache(GetCurrentProcess(), patch.address, patch.size);
             DWORD unused = 0;
-            const BOOL restored = VirtualProtect(h.call + 1, 4, old, &unused);
+            const BOOL restored = VirtualProtect(patch.address, patch.size, old, &unused);
             if (!flushed || !restored) { completed = false; break; }
         }
-        okay = completed && written == hooks.size();
+        okay = completed && written == count;
         if (!okay) {
             for (size_t i = 0; i < written; ++i) {
-                auto& h = hooks[i];
+                const auto& patch = patches[i];
                 DWORD old = 0;
-                if (VirtualProtect(h.call + 1, 4, PAGE_EXECUTE_READWRITE, &old)) {
-                    memcpy(h.call + 1, &h.before, 4);
-                    FlushInstructionCache(GetCurrentProcess(), h.call, 5);
+                if (VirtualProtect(patch.address, patch.size, PAGE_EXECUTE_READWRITE, &old)) {
+                    memcpy(patch.address, patch.before, patch.size);
+                    FlushInstructionCache(GetCurrentProcess(), patch.address, patch.size);
                     DWORD unused = 0;
-                    VirtualProtect(h.call + 1, 4, old, &unused);
+                    VirtualProtect(patch.address, patch.size, old, &unused);
                 }
             }
         }
@@ -237,7 +340,7 @@ bool Publish(std::array<Hook, 3>& hooks) {
 
 bool Initialize() {
     if (!PrepareLog()) return Fail("log_open_failed");
-    Log("initialize version=0.1.0");
+    Log("initialize version=0.1.1");
     wchar_t executable[32768]{};
     const DWORD count = GetModuleFileNameW(nullptr, executable, 32768);
     if (!count || count >= 32768) return Fail("exe_path_failed");
@@ -251,6 +354,8 @@ bool Initialize() {
         {"overlay",preOverlay,sizeof(preOverlay),postOverlay,sizeof(postOverlay),reinterpret_cast<const void*>(&FastInterpGetFrameOverlay),false},
         {"ui",preUI,sizeof(preUI),postUI,sizeof(postUI),reinterpret_cast<const void*>(&FastInterpGetFrameUI),false}
     }};
+    FrameIdentityHook identity;
+    if (!FindFrameIdentitySite(identity, start, size)) return Fail("frame_identity_signature_not_unique_or_missing");
     uint8_t* original = nullptr;
     for (auto& h : hooks) {
         if (!FindUnique(h, start, size)) return Fail("signature_not_unique_or_missing");
@@ -271,26 +376,35 @@ bool Initialize() {
     if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) return Fail("qpc_unavailable");
     g_qpcInvFreq = 1.0 / static_cast<double>(frequency.QuadPart);
     g_origAnimGetFrame = reinterpret_cast<AnimGetFrame_t>(original);
+    if (!PrepareFrameIdentityStub(identity)) {
+        identity.Release();
+        return Fail("frame_identity_relay_prepare_failed");
+    }
     for (auto& h : hooks) {
         if (!PrepareStub(h)) {
             for (auto& p : hooks) if (p.stub) VirtualFree(p.stub, 0, MEM_RELEASE);
+            identity.Release();
             return Fail("relay_prepare_failed");
         }
     }
     // 原生钩子跨 Lua VM 重建保留，必须固定 DLL，不能由 FFI GC 卸载。
     HMODULE pinned = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-        reinterpret_cast<LPCWSTR>(&Initialize), &pinned)) return Fail("module_pin_failed");
-    if (!Publish(hooks)) return Fail("hook_publish_failed");
+        reinterpret_cast<LPCWSTR>(&Initialize), &pinned)) {
+        for (auto& h : hooks) VirtualFree(h.stub, 0, MEM_RELEASE);
+        identity.Release();
+        return Fail("module_pin_failed");
+    }
+    if (!Publish(hooks, &identity)) return Fail("hook_publish_failed");
     g_installed = true;
     strcpy_s(g_lastError, "ok");
-    Log("installed channels=main,overlay,ui algorithm=unchanged enabled=0");
+    Log("installed channels=main,overlay,ui frame_identity=original enabled=0");
     return true;
 }
 } // namespace
 
 #define HS_EXPORT extern "C" __declspec(dllexport)
-HS_EXPORT const char* HS_Version() { return "0.1.0"; }
+HS_EXPORT const char* HS_Version() { return "0.1.1"; }
 HS_EXPORT const char* HS_LastError() { return g_lastError; }
 HS_EXPORT int HS_Initialize() {
     AcquireSRWLockExclusive(&g_initLock);

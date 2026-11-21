@@ -132,7 +132,7 @@ if not loaded then
     return
 end
 local version = ffi.string(native.HS_Version())
-if version ~= "0.1.0" then
+if version ~= "0.1.1" then
     G.print(prefix .. "DLL 版本不匹配，请完全退出游戏后重新构建或更新。")
     return
 end
@@ -151,7 +151,7 @@ local api = {
 }
 function api.SetEnabled(value)
     local success = native.HS_SetEnabled(value and 1 or 0) == 1
-    G.print(prefix .. (success and (value and "补帧已开启。" or "补帧已关闭，当前使用游戏原始取帧。") or "切换失败。"))
+    if not success then G.print(prefix .. "切换失败。") end
     return success
 end
 function api.GetStats()
@@ -172,4 +172,3 @@ end
 -- 当前 VM 持有原生接口；LoadLibrary 引用、DLL 和钩子常驻到进程退出。
 G.rawset(G, "DST_ANIMATION_TWEEN", api)
 api.SetEnabled(true)
-G.print(prefix .. "0.1.0 三条取帧钩子已安装；请在本地控制台进行对照测试。")

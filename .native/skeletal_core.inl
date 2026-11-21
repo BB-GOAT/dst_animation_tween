@@ -116,6 +116,7 @@ static inline bool TweenElementMatrix(const uint16_t m0h[6], const uint16_t m1h[
 struct AnimBufferSlot {
     AnimFrame frame{};
     std::vector<AnimElement> elems;
+    const AnimFrame* original = nullptr;
 };
 
 struct EntityAnimTrack {
@@ -140,6 +141,16 @@ struct ThreadLocalAnimState {
 };
 
 thread_local uintptr_t g_tlsLastParentKey = 0;
+thread_local ThreadLocalAnimState* g_tlsAnimState = nullptr;
+
+// 绘制读取插值副本，帧序号计算必须使用原始数组中的帧身份。
+static const AnimFrame* ResolveFrameIdentity(const AnimFrame* frame) noexcept {
+    if (!g_tlsAnimState) return frame;
+    for (const auto& slot : g_tlsAnimState->slots) {
+        if (frame == &slot.frame && slot.original) return slot.original;
+    }
+    return frame;
+}
 
 static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, float time, uintptr_t key, bool isMainParent) {
     if (!animPtr || !g_origAnimGetFrame) {
@@ -157,6 +168,7 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     }
 
     thread_local ThreadLocalAnimState tls;
+    g_tlsAnimState = &tls;
     if (isMainParent && key != 0) {
         g_tlsLastParentKey = key;
     }
@@ -286,6 +298,10 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
 
     AnimBufferSlot& bufSlot = tls.slots[(tls.ring++) & 3];
     if (bufSlot.elems.size() < n0) bufSlot.elems.resize(n0);
+
+    // 使用游戏自己的取帧结果保留当前播放时间的帧身份，而非猜测索引。
+    bufSlot.original = static_cast<const AnimFrame*>(g_origAnimGetFrame(animPtr, playMode, time));
+    if (!bufSlot.original) return nullptr;
 
     bufSlot.frame = f0;
     bufSlot.frame.elements = bufSlot.elems.data();
