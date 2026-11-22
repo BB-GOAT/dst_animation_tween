@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <memory>
 #include <algorithm>
+#include <limits>
 
 namespace {
 using AnimGetFrame_t = const void* (*)(const void*, int32_t, float);
@@ -32,7 +33,9 @@ bool g_installed = false;
 char g_lastError[256] = "not_initialized";
 std::wstring g_logPath;
 
+#include "render_geometry.inl"
 #include "skeletal_core.inl"
+#include "overlay_path.inl"
 
 void Log(const char* format, ...) {
     FILE* file = nullptr;
@@ -151,10 +154,17 @@ struct Hook {
     size_t postSize;
     const void* replacement;
     bool parent;
+    bool overlay = false, direct = false;
+    RUNTIME_FUNCTION* unwind = nullptr;
     uint8_t* call = nullptr;
     uint8_t* stub = nullptr;
     int32_t before = 0;
     int32_t after = 0;
+    void Release() {
+        if (unwind) RtlDeleteFunctionTable(unwind);
+        if (stub) VirtualFree(stub, 0, MEM_RELEASE);
+        unwind = nullptr; stub = nullptr;
+    }
 };
 
 // 检查调用点签名唯一命中，以及三个原调用目标一致。
@@ -164,6 +174,39 @@ constexpr uint8_t preOverlay[] = {0x8B,0x53,0x10,0x48,0x8B,0x0B,0xF3,0x0F,0x10,0
 constexpr uint8_t postOverlay[] = {0x48,0x8B,0xF0,0x48,0x85,0xC0,0x0F,0x84};
 constexpr uint8_t preUI[] = {0x8B,0x93,0x14,0x01,0,0,0xF3,0x0F,0x10,0x93,0x18,0x01,0,0,0xE8};
 constexpr uint8_t postUI[] = {0x48,0x8B,0xE8,0x48,0x85,0xC0,0x0F,0x84};
+
+constexpr uint8_t preOverlayRender[] = {
+    0x4C,0x89,0x4C,0x24,0x30,0x4C,0x89,0x54,0x24,0x28,0x4C,0x8D,
+    0x8C,0x24,0xB0,0x01,0x00,0x00,0x4C,0x89,0x5C,0x24,0x20,0xE8,
+};
+constexpr uint8_t postOverlayRender[] = {
+    0x48,0x8B,0xB4,0x24,0xD0,0x00,0x00,0x00,0xEB,0x08,0x48,0x8B,
+    0xB4,0x24,0xD0,0x00,0x00,0x00,0x48,0x81,0xC3,0x20,0x01,0x00,
+    0x00,0x48,0x3B,0x5F,0x38,
+};
+// 包括按符号查节点、读取子项vector首尾以及0x120字节步长的完整控制流。
+constexpr uint8_t kOverlayLayout[] = {
+    0x49,0x8B,0x51,0x08,0x48,0x89,0x8C,0x24,0xD8,0x00,0x00,0x00,
+    0x48,0x3B,0xCA,0x74,0x13,0x8B,0x41,0x18,0x41,0x39,0x40,0x10,
+    0x72,0x0A,0x48,0x8D,0xBC,0x24,0xD8,0x00,0x00,0x00,0xEB,0x10,
+    0x48,0x89,0x94,0x24,0x80,0x01,0x00,0x00,0x48,0x8D,0xBC,0x24,
+    0x80,0x01,0x00,0x00,0x48,0x8B,0x3F,0x48,0x3B,0xFA,0x0F,0x84,
+    0x89,0x04,0x00,0x00,0x48,0x85,0xF6,0x75,0x37,0x48,0x8B,0x84,
+    0x24,0x30,0x07,0x00,0x00,0x48,0x8B,0xB4,0x24,0xD0,0x00,0x00,
+    0x00,0x4C,0x8B,0x8C,0x24,0x28,0x07,0x00,0x00,0x4C,0x8B,0x84,
+    0x24,0x20,0x07,0x00,0x00,0x48,0x8D,0x8C,0x24,0x40,0x01,0x00,
+    0x00,0x48,0x8B,0xD6,0x48,0x89,0x44,0x24,0x20,0xE8,0x54,0xF1,
+    0xFF,0xFF,0xEB,0x08,0x48,0x8B,0xB4,0x24,0xD0,0x00,0x00,0x00,
+    0x48,0x8B,0x5F,0x30,0x48,0x3B,0x5F,0x38,0x0F,0x84,0x51,0x04,
+    0x00,0x00,
+};
+static bool VerifyOverlayLayout(const uint8_t* text, size_t size) {
+    unsigned matches = 0;
+    if (size >= sizeof(kOverlayLayout))
+        for (size_t i = 0; i <= size - sizeof(kOverlayLayout); ++i)
+            if (text[i] == kOverlayLayout[0] && !memcmp(text + i, kOverlayLayout, sizeof(kOverlayLayout))) ++matches;
+    return matches == 1;
+}
 
 bool FindUnique(Hook& hook, uint8_t* start, size_t size) {
     const size_t total = hook.preSize + 4 + hook.postSize;
@@ -194,10 +237,28 @@ uint8_t* AllocNearExecutable(uint8_t* nearAddress, size_t size = 64) {
 }
 
 bool PrepareStub(Hook& hook) {
-    hook.stub = AllocNearExecutable(hook.call);
+    hook.stub = AllocNearExecutable(hook.call, 128);
     if (!hook.stub) return false;
     const uint64_t destination = reinterpret_cast<uint64_t>(hook.replacement);
-    if (hook.parent) {
+    if (hook.overlay) {
+        // 保存调用点的rbx子项和rdi符号节点；不改写调用者的栈参数或局部变量。
+        uint8_t code[] = {0x48,0x83,0xEC,0x38,0x48,0x89,0x5C,0x24,0x20,
+            0x48,0x89,0x7C,0x24,0x28,0x4C,0x8D,0x4C,0x24,0x20,
+            0x48,0xB8,0,0,0,0,0,0,0,0,0xFF,0xD0,0x48,0x83,0xC4,0x38,0xC3};
+        memcpy(code + 21, &destination, 8);
+        memcpy(hook.stub, code, sizeof(code));
+        hook.unwind = reinterpret_cast<RUNTIME_FUNCTION*>(hook.stub + 64);
+        *hook.unwind = {0, sizeof(code), 80};
+        const uint8_t unwind[] = {1,4,1,0,4,0x62,0,0}; // UWOP_ALLOC_SMALL: 56字节
+        memcpy(hook.stub + 80, unwind, sizeof(unwind));
+        if (!RtlAddFunctionTable(hook.unwind, 1, reinterpret_cast<DWORD64>(hook.stub))) {
+            hook.unwind = nullptr; return false;
+        }
+    } else if (hook.direct) {
+        const uint8_t code[] = {0xFF,0x25,0,0,0,0};
+        memcpy(hook.stub, code, sizeof(code));
+        memcpy(hook.stub + sizeof(code), &destination, 8);
+    } else if (hook.parent) {
         uint8_t code[18] = {0x4C,0x8B,0x4B,0x08,0xFF,0x25,0,0,0,0};
         memcpy(code + 10, &destination, 8);
         memcpy(hook.stub, code, sizeof(code));
@@ -210,8 +271,8 @@ bool PrepareStub(Hook& hook) {
     if (delta < INT32_MIN || delta > INT32_MAX) return false;
     hook.after = static_cast<int32_t>(delta);
     DWORD old = 0;
-    return VirtualProtect(hook.stub, 64, PAGE_EXECUTE_READ, &old)
-        && FlushInstructionCache(GetCurrentProcess(), hook.stub, 64);
+    return VirtualProtect(hook.stub, 128, PAGE_EXECUTE_READ, &old)
+        && FlushInstructionCache(GetCurrentProcess(), hook.stub, 128);
 }
 
 struct FrameIdentityHook {
@@ -307,7 +368,7 @@ bool PrepareFrameIdentityStub(FrameIdentityHook& hook) {
 }
 
 // FFI 初始化可能发生在 smooth_loading 正在刷新画面时。
-// 所有分配和日志先完成，只在发布三处 call 位移和帧身份修复期间暂停其他现存线程；
+// 所有分配和日志先完成，只在发布取帧、附属递归 call 位移和帧身份修复期间暂停其他现存线程；
 // 暂停区不调用 Lua、日志、堆分配或加载器，失败时恢复原位移并恢复线程。
 class PausedThreads {
     std::vector<HANDLE> handles;
@@ -348,9 +409,9 @@ public:
     }
 };
 
-bool Publish(std::array<Hook, 3>& hooks, FrameIdentityHook* identity = nullptr) {
+template<size_t N> bool Publish(std::array<Hook, N>& hooks, FrameIdentityHook* identity = nullptr) {
     struct Patch { uint8_t* address; const void* before; const void* after; size_t size; };
-    std::array<Patch, 4> patches{};
+    std::array<Patch, N + 1> patches{};
     size_t count = 0;
     // 身份修复先于取帧重定向安装；同一暂停区内完成并统一回滚。
     if (identity) patches[count++] = {identity->site, identity->before.data(), identity->after.data(), identity->before.size()};
@@ -397,7 +458,7 @@ bool Publish(std::array<Hook, 3>& hooks, FrameIdentityHook* identity = nullptr) 
 
 bool Initialize() {
     if (!PrepareLog()) return Fail("log_open_failed");
-    Log("initialize version=0.1.4");
+    Log("initialize version=0.1.10");
     wchar_t executable[32768]{};
     const DWORD count = GetModuleFileNameW(nullptr, executable, 32768);
     if (!count || count >= 32768) return Fail("exe_path_failed");
@@ -406,10 +467,13 @@ bool Initialize() {
     uint8_t* start = nullptr;
     size_t size = 0;
     if (!GetTextSection(start, size)) return Fail("text_section_missing");
-    std::array<Hook, 3> hooks{{
-        {"main",preMain,sizeof(preMain),postMain,sizeof(postMain),reinterpret_cast<const void*>(&FastInterpGetFrameMain),true},
-        {"overlay",preOverlay,sizeof(preOverlay),postOverlay,sizeof(postOverlay),reinterpret_cast<const void*>(&FastInterpGetFrameOverlay),false},
-        {"ui",preUI,sizeof(preUI),postUI,sizeof(postUI),reinterpret_cast<const void*>(&FastInterpGetFrameUI),false}
+    if (!VerifyFrameGeometryLayout(start, size, g_frameGeometry)) return Fail("frame_geometry_branch_not_unique_or_changed");
+    if (!VerifyOverlayLayout(start, size)) return Fail("overlay_layout_not_unique_or_changed");
+    std::array<Hook, 4> hooks{{
+        {"main",preMain,sizeof(preMain),postMain,sizeof(postMain),reinterpret_cast<const void*>(&FastInterpGetFrameMain),false},
+        {"overlay",preOverlay,sizeof(preOverlay),postOverlay,sizeof(postOverlay),reinterpret_cast<const void*>(&FastInterpGetFrameOverlay),false,true},
+        {"ui",preUI,sizeof(preUI),postUI,sizeof(postUI),reinterpret_cast<const void*>(&FastInterpGetFrameUI),false},
+        {"overlay_path",preOverlayRender,sizeof(preOverlayRender),postOverlayRender,sizeof(postOverlayRender),reinterpret_cast<const void*>(&RenderOverlayWithPath),false,false,true}
     }};
     FrameIdentityHook identity;
     if (!FindFrameIdentitySite(identity, start, size)) return Fail("frame_identity_signature_not_unique_or_missing");
@@ -421,6 +485,12 @@ bool Initialize() {
         const auto begin = reinterpret_cast<intptr_t>(start);
         if (address < begin || address > begin + static_cast<intptr_t>(size) - 16) return Fail("original_target_outside_text");
         auto* target = reinterpret_cast<uint8_t*>(address);
+        if (h.direct) {
+            constexpr uint8_t entry[] = {0x4C,0x89,0x4C,0x24,0x20,0x4C,0x89,0x44,0x24,0x18};
+            if (memcmp(target, entry, sizeof(entry))) return Fail("overlay_render_prologue_changed");
+            g_origOverlayRender = reinterpret_cast<OverlayRender_t>(target);
+            continue;
+        }
         if (original && original != target) return Fail("original_targets_differ");
         original = target;
     }
@@ -439,7 +509,7 @@ bool Initialize() {
     }
     for (auto& h : hooks) {
         if (!PrepareStub(h)) {
-            for (auto& p : hooks) if (p.stub) VirtualFree(p.stub, 0, MEM_RELEASE);
+            for (auto& p : hooks) p.Release();
             identity.Release();
             return Fail("relay_prepare_failed");
         }
@@ -448,7 +518,7 @@ bool Initialize() {
     HMODULE pinned = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
         reinterpret_cast<LPCWSTR>(&Initialize), &pinned)) {
-        for (auto& h : hooks) VirtualFree(h.stub, 0, MEM_RELEASE);
+        for (auto& h : hooks) h.Release();
         identity.Release();
         return Fail("module_pin_failed");
     }
@@ -461,7 +531,7 @@ bool Initialize() {
 } // namespace
 
 #define HS_EXPORT extern "C" __declspec(dllexport)
-HS_EXPORT const char* HS_Version() { return "0.1.4"; }
+HS_EXPORT const char* HS_Version() { return "0.1.10"; }
 HS_EXPORT const char* HS_LastError() { return g_lastError; }
 HS_EXPORT int HS_Initialize() {
     AcquireSRWLockExclusive(&g_initLock);
@@ -486,5 +556,6 @@ HS_EXPORT int HS_ReadStats(uint64_t* values, uint32_t count) {
     values[2] = static_cast<uint64_t>(InterlockedCompareExchange64(&g_animInterpFrames, 0, 0));
     values[3] = static_cast<uint64_t>(InterlockedCompareExchange64(&g_animElemsTweened, 0, 0));
     values[4] = static_cast<uint64_t>(InterlockedCompareExchange64(&g_animPass2Swaps, 0, 0));
+    if (count >= 6) values[5] = static_cast<uint64_t>(InterlockedCompareExchange64(&g_frameGeometryFrames, 0, 0));
     return 1;
 }

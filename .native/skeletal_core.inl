@@ -81,24 +81,24 @@ static inline bool TweenElementMatrix(const uint16_t m0h[6], const uint16_t m1h[
     float det1 = a1 * d1 - b1 * c1;
     if (det0 * det1 < 0.0f) return false;
 
-    float su0 = sqrtf(a0 * a0 + c0 * c0);
-    float su1 = sqrtf(a1 * a1 + c1 * c1);
-    float sv0 = sqrtf(b0 * b0 + d0 * d0);
-    float sv1 = sqrtf(b1 * b1 + d1 * d1);
+    float su0 = sqrtf(a0 * a0 + b0 * b0);
+    float su1 = sqrtf(a1 * a1 + b1 * b1);
+    float sv0 = sqrtf(c0 * c0 + d0 * d0);
+    float sv1 = sqrtf(c1 * c1 + d1 * d1);
 
     float a, b, c, d;
     if (su0 > 1e-4f && su1 > 1e-4f && sv0 > 1e-4f && sv1 > 1e-4f) {
-        float au0 = atan2f(c0, a0), au1 = atan2f(c1, a1);
+        float au0 = atan2f(b0, a0), au1 = atan2f(b1, a1);
         float du = WrapAngleDiff(au1 - au0);
-        float av0 = atan2f(d0, b0), av1 = atan2f(d1, b1);
+        float av0 = atan2f(d0, c0), av1 = atan2f(d1, c1);
         float dv = WrapAngleDiff(av1 - av0);
         // Allow fast weapon swings & boss attacks up to ~135 deg/tick (2.35 rad)
         if (fabsf(du) > 2.35f || fabsf(dv) > 2.35f) return false;
 
         float su = su0 + (su1 - su0) * t, au = au0 + du * t;
         float sv = sv0 + (sv1 - sv0) * t, av = av0 + dv * t;
-        a = su * cosf(au); c = su * sinf(au);
-        b = sv * cosf(av); d = sv * sinf(av);
+        a = su * cosf(au); b = su * sinf(au);
+        c = sv * cosf(av); d = sv * sinf(av);
     } else {
         a = a0 + (a1 - a0) * t; b = b0 + (b1 - b0) * t;
         c = c0 + (c1 - c0) * t; d = d0 + (d1 - d0) * t;
@@ -134,20 +134,36 @@ struct EntityAnimTrack {
 constexpr size_t kTrackSlots = 8192;
 
 struct ThreadLocalAnimState {
-    AnimBufferSlot slots[4];
-    uint32_t ring = 0;
+    // 一次顶层绘制可能递归绘制多个附属动画；返回过的帧在这轮结束前不能覆盖。
+    // unique_ptr保证扩容不移动已有槽位；下一次顶层绘制再复用全部分配。
+    std::vector<std::unique_ptr<AnimBufferSlot>> slots;
+    size_t ring = 0;
     std::vector<EntityAnimTrack> tracks;
     LONG64 epoch = 0;
     ThreadLocalAnimState() : tracks(kTrackSlots) {}
+    AnimBufferSlot& NextSlot() {
+        if (ring == slots.size()) slots.push_back(std::make_unique<AnimBufferSlot>());
+        return *slots[ring++];
+    }
 };
 
 thread_local uintptr_t g_tlsLastParentKey = 0;
 thread_local ThreadLocalAnimState* g_tlsAnimState = nullptr;
 
+static ThreadLocalAnimState& GetThreadAnimState() {
+    if (g_tlsAnimState) return *g_tlsAnimState;
+    thread_local ThreadLocalAnimState state;
+    g_tlsAnimState = &state;
+    return state;
+}
+
+static void BeginAnimDraw() { GetThreadAnimState().ring = 0; }
+
 // 绘制读取插值副本，帧序号计算必须使用原始数组中的帧身份。
 static const AnimFrame* ResolveFrameIdentity(const AnimFrame* frame) noexcept {
     if (!g_tlsAnimState) return frame;
-    for (const auto& slot : g_tlsAnimState->slots) {
+    for (size_t i = 0; i < g_tlsAnimState->ring; ++i) {
+        const auto& slot = *g_tlsAnimState->slots[i];
         if (frame == &slot.frame && slot.original) return slot.original;
     }
     return frame;
@@ -156,7 +172,7 @@ static const AnimFrame* ResolveFrameIdentity(const AnimFrame* frame) noexcept {
 #include "matrix_plan.inl"
 #include "animation_plan.inl"
 
-static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, float time, uintptr_t key, bool isMainParent) {
+static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, float time, uintptr_t key, bool isMainParent, bool frameGeometry = false) {
     if (!animPtr || !g_origAnimGetFrame) {
         return g_origAnimGetFrame ? g_origAnimGetFrame(animPtr, playMode, time) : nullptr;
     }
@@ -171,14 +187,13 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         return g_origAnimGetFrame(animPtr, playMode, time);
     }
 
-    thread_local ThreadLocalAnimState tls;
-    g_tlsAnimState = &tls;
+    auto& tls = GetThreadAnimState();
     // 新VM重新启用或手动切换后，不复用上一代实体地址对应的播放历史。
     const LONG64 epoch = InterlockedCompareExchange64(&g_planEpoch, 0, 0);
     if (tls.epoch != epoch) {
         for (auto& track : tls.tracks) track = {};
         tls.epoch = epoch;
-        g_tlsLastParentKey = 0;
+        // 顶层入口已刷新父实体；附属动画不能在此清除它。
     }
     if (isMainParent && key != 0) {
         g_tlsLastParentKey = key;
@@ -316,33 +331,50 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
 
     if (frac <= 0.015f) return &f0;
     if (frac >= 0.985f) return &f1;
-    if (plan.matrices.empty()) return &f0;
+    if (plan.matrices.empty()) return (frameGeometry || !plan.trajectory) && frac >= 0.5f ? &f1 : &f0;
 
-    AnimBufferSlot& bufSlot = tls.slots[(tls.ring++) & 3];
-    const uint32_t outputCount = static_cast<uint32_t>(plan.matrices.size());
+    AnimBufferSlot& bufSlot = tls.NextSlot();
+    const auto& anchor = frac >= 0.5f ? f1 : f0;
+    const bool endpointOrder = frameGeometry || !plan.trajectory;
+    const uint32_t outputCount = endpointOrder ? anchor.num_elements : static_cast<uint32_t>(plan.matrices.size());
     if (bufSlot.elems.size() < outputCount) bufSlot.elems.resize(outputCount);
 
-    // 使用游戏自己的取帧结果保留当前播放时间的帧身份，而非猜测索引。
-    bufSlot.original = static_cast<const AnimFrame*>(g_origAnimGetFrame(animPtr, playMode, time));
-    if (!bufSlot.original) return nullptr;
-
-    bufSlot.frame = f0;
-    bufSlot.frame.elements = bufSlot.elems.data();
-    bufSlot.frame.num_elements = outputCount;
-    // meta 中含有引擎字符串缓存指针，输出必须从本次有效输入复制。
-    if (!plan.trajectory) {
-        memcpy(bufSlot.elems.data(), f0.elements, outputCount * sizeof(AnimElement));
+    if (endpointOrder) {
+        // 普通输出也使用端点的真实元素列表：未配对的出生/消失不制造跨实例运动，
+        // 图层、遮挡次序与换片同时切换；只有对应明确的矩阵参与插值。
+        // 预生成顶点使用原始帧编号和该帧的元素槽位，不能和另一帧的矩阵列表混用。
+        // 几何、贴片、meta及元素次序一起选择端点；每个槽位再应用其对应的插值矩阵。
+        bufSlot.original = frameGeometry ? &anchor :
+            static_cast<const AnimFrame*>(g_origAnimGetFrame(animPtr, playMode, time));
+        if (!bufSlot.original) return nullptr;
+        bufSlot.frame = anchor;
+        bufSlot.frame.elements = bufSlot.elems.data();
+        const auto& order = frac >= 0.5f ? plan.secondOrder : plan.firstOrder;
+        if (outputCount) memcpy(bufSlot.elems.data(), anchor.elements, outputCount * sizeof(AnimElement));
+        for (uint32_t i = 0; i < outputCount; ++i) {
+            const int slot = order[i];
+            if (slot >= 0 && plan.matrices[slot].mode) ApplyMatrix(plan.matrices[slot], frac, bufSlot.elems[i].m);
+        }
+        if (frameGeometry) InterlockedIncrement64(&g_frameGeometryFrames);
     } else {
+        // 使用游戏自己的取帧结果保留当前播放时间的帧身份，而非猜测索引。
+        bufSlot.original = static_cast<const AnimFrame*>(g_origAnimGetFrame(animPtr, playMode, time));
+        if (!bufSlot.original) return nullptr;
+
+        bufSlot.frame = f0;
+        bufSlot.frame.elements = bufSlot.elems.data();
+        bufSlot.frame.num_elements = outputCount;
+        // meta 中含有引擎字符串缓存指针，输出必须从本次有效输入复制。
         for (uint32_t i = 0; i < outputCount; ++i) {
             const auto& ref = plan.sources[i];
             bufSlot.elems[i] = ref.target ? f1.elements[ref.index] : f0.elements[ref.index];
         }
-    }
 
-    for (uint32_t i = 0; i < outputCount; ++i) {
-        if (plan.matrices[i].mode) ApplyMatrix(plan.matrices[i], frac, bufSlot.elems[i].m);
-        if (plan.swaps[i] && frac >= 0.5f && plan.matrices[i].mode) {
-            bufSlot.elems[i].frame_num = plan.targetSprite[i];
+        for (uint32_t i = 0; i < outputCount; ++i) {
+            if (plan.matrices[i].mode) ApplyMatrix(plan.matrices[i], frac, bufSlot.elems[i].m);
+            if (plan.swaps[i] && frac >= 0.5f && plan.matrices[i].mode) {
+                bufSlot.elems[i].frame_num = plan.targetSprite[i];
+            }
         }
     }
     const auto tweenedCount = plan.tweened;
@@ -356,16 +388,50 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     return &bufSlot.frame;
 }
 
-extern "C" const void* FastInterpGetFrameMain(const void* animPtr, int32_t playMode, float time, const void* persistentAnimNode) {
-    return InterpGetFrameCore(animPtr, playMode, time, reinterpret_cast<uintptr_t>(persistentAnimNode), true);
+extern "C" const void* FastInterpGetFrameMain(const void* animPtr, int32_t playMode, float time, const void* renderCommand) {
+    BeginAnimDraw();
+    if (!renderCommand) return g_origAnimGetFrame ? g_origAnimGetFrame(animPtr, playMode, time) : nullptr;
+    const auto key = ReadGeometryField<uintptr_t>(renderCommand, 8);
+    // 即使单帧或关闭补帧，也刷新父实体，避免后续附属通道继承上一个实体。
+    g_tlsLastParentKey = key;
+    return InterpGetFrameCore(animPtr, playMode, time, key, true, UsesFrameGeometry(renderCommand));
 }
 
 extern "C" const void* FastInterpGetFrameUI(const void* animPtr, int32_t playMode, float time, const void* persistentAnimNode) {
-    return InterpGetFrameCore(animPtr, playMode, time, reinterpret_cast<uintptr_t>(persistentAnimNode), false);
+    BeginAnimDraw();
+    g_tlsLastParentKey = reinterpret_cast<uintptr_t>(persistentAnimNode);
+    return InterpGetFrameCore(animPtr, playMode, time, reinterpret_cast<uintptr_t>(persistentAnimNode), true);
 }
 
-extern "C" const void* FastInterpGetFrameOverlay(const void* animPtr, int32_t playMode, float time, const void* overlayItem) {
-    uintptr_t baseKey = (g_tlsLastParentKey != 0) ? g_tlsLastParentKey : reinterpret_cast<uintptr_t>(overlayItem);
-    uintptr_t childKey = (baseKey ^ (reinterpret_cast<uintptr_t>(animPtr) * 0x9E3779B97F4A7C15ULL)) | 1ULL;
-    return InterpGetFrameCore(animPtr, playMode, time, childKey, false);
+// 附属绘制记录由每轮渲染快照重建，记录地址不能作为跨帧实例身份。
+// 使用父挂接路径、目标符号和该符号下的子项序号；递归期间保存并恢复父路径。
+struct OverlayDrawContext { const void* item; const void* node; };
+thread_local uintptr_t g_tlsOverlayChildKey = 0;
+
+static uintptr_t OverlayTrackKey(const void* animPtr, const OverlayDrawContext& draw) noexcept {
+    if (!g_tlsLastParentKey || !draw.item || !draw.node) return 0;
+    const uintptr_t begin = ReadGeometryField<uintptr_t>(draw.node, 0x30);
+    const uintptr_t end = ReadGeometryField<uintptr_t>(draw.node, 0x38);
+    const uintptr_t item = reinterpret_cast<uintptr_t>(draw.item);
+    if (item < begin || item >= end || (item - begin) % 0x120) return 0;
+    const uintptr_t index = (item - begin) / 0x120;
+    const uint32_t symbol = ReadGeometryField<uint32_t>(draw.node, 0x18);
+    uintptr_t key = g_tlsLastParentKey ^ (reinterpret_cast<uintptr_t>(animPtr) * 0x9E3779B97F4A7C15ULL);
+    key ^= static_cast<uintptr_t>(symbol) * 0xD6E8FEB86659FD93ULL;
+    key ^= (index + 1) * 0xA0761D6478BD642FULL;
+    key ^= key >> 32;
+    return key | 1ULL;
 }
+
+extern "C" const void* FastInterpGetFrameOverlay(const void* animPtr, int32_t playMode, float time,
+                                                 const OverlayDrawContext* draw) {
+    g_tlsOverlayChildKey = draw ? OverlayTrackKey(animPtr, *draw) : 0;
+    return InterpGetFrameCore(animPtr, playMode, time, g_tlsOverlayChildKey, false);
+}
+
+class OverlayPathScope {
+    uintptr_t parent = g_tlsLastParentKey, child = g_tlsOverlayChildKey;
+public:
+    OverlayPathScope() noexcept { g_tlsLastParentKey = child; g_tlsOverlayChildKey = 0; }
+    ~OverlayPathScope() { g_tlsLastParentKey = parent; g_tlsOverlayChildKey = child; }
+};

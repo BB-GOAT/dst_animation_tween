@@ -5,7 +5,7 @@ description = [[
 模组更新后，请重启游戏以加载新版文件
 ]]
 author = "冰冰羊"
-version = "0.1.4"
+version = "0.1.10"
 api_version = 10
 dst_compatible = true
 client_only_mod = true

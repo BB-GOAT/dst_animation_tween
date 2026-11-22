@@ -132,7 +132,7 @@ if not loaded then
     return
 end
 local version = ffi.string(native.HS_Version())
-if version ~= "0.1.4" then
+if version ~= "0.1.10" then
     G.print(prefix .. "DLL 版本不匹配，请完全退出游戏后重新构建或更新。")
     return
 end
@@ -155,18 +155,19 @@ function api.SetEnabled(value)
     return success
 end
 function api.GetStats()
-    local values = ffi.new("uint64_t[5]")
-    if native.HS_ReadStats(values, 5) ~= 1 then return end
+    local values = ffi.new("uint64_t[6]")
+    if native.HS_ReadStats(values, 6) ~= 1 then return end
     local result = {
         installed = values[0] ~= 0,
         enabled = values[1] ~= 0,
         interpolated_frames = G.tonumber(values[2]),
         tweened_elements = G.tonumber(values[3]),
         sprite_swap_matches = G.tonumber(values[4]),
+        frame_geometry_frames = G.tonumber(values[5]),
     }
-    G.print(prefix .. G.string.format("installed=%s enabled=%s interpolated_frames=%d tweened_elements=%d sprite_swap_matches=%d",
+    G.print(prefix .. G.string.format("installed=%s enabled=%s interpolated_frames=%d tweened_elements=%d sprite_swap_matches=%d frame_geometry_frames=%d",
         G.tostring(result.installed), G.tostring(result.enabled), result.interpolated_frames,
-        result.tweened_elements, result.sprite_swap_matches))
+        result.tweened_elements, result.sprite_swap_matches, result.frame_geometry_frames))
     return result
 end
 -- 当前 VM 持有原生接口；LoadLibrary 引用、DLL 和钩子常驻到进程退出。

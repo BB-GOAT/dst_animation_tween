@@ -50,7 +50,7 @@ local function run(label, native, previous)
             cast = function(_, value) return value end,
             string = function(value) return type(value) == "table" and value.text or value end,
             new = function(ctype)
-                if ctype == "uint64_t[5]" then return {[0]=1,1,2,3,4} end
+                if ctype == "uint64_t[6]" then return {[0]=1,1,2,3,4,5} end
                 return {}
             end,
             gc = function(value, finalizer) value.finalizer = finalizer; return value end,

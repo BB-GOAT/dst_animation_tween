@@ -1,4 +1,5 @@
 // 相邻矩阵的分解只在输入改变时计算；每次绘制仍使用实际插值进度。
+// 动画的两个变换轴按(a,b)、(c,d)存放；按列分解会将非等比缩放混入旋转。
 struct MatrixPlan {
     // mode=0保留原矩阵；1线性；2插值轴角与长度；3轴角恒定。
     // 极分解布局：[su, dsu, au, dau, sv, dsv, av, dav, tx, dtx, ty, dty]。
@@ -13,11 +14,11 @@ static MatrixPlan PrepareMatrix(const uint16_t* m0h, const uint16_t* m1h) {
     float tx0 = HalfToFloat(m0h[4]), ty0 = HalfToFloat(m0h[5]);
     float dtx = HalfToFloat(m1h[4]) - tx0, dty = HalfToFloat(m1h[5]) - ty0;
     if (fabsf(dtx) > 420 || fabsf(dty) > 420 || (a0 * d0 - b0 * c0) * (a1 * d1 - b1 * c1) < 0) return p;
-    float su0 = sqrtf(a0 * a0 + c0 * c0), su1 = sqrtf(a1 * a1 + c1 * c1);
-    float sv0 = sqrtf(b0 * b0 + d0 * d0), sv1 = sqrtf(b1 * b1 + d1 * d1);
+    float su0 = sqrtf(a0 * a0 + b0 * b0), su1 = sqrtf(a1 * a1 + b1 * b1);
+    float sv0 = sqrtf(c0 * c0 + d0 * d0), sv1 = sqrtf(c1 * c1 + d1 * d1);
     if (su0 > 1e-4f && su1 > 1e-4f && sv0 > 1e-4f && sv1 > 1e-4f) {
-        float au0 = atan2f(c0, a0), au1 = atan2f(c1, a1), du = WrapAngleDiff(au1 - au0);
-        float av0 = atan2f(d0, b0), av1 = atan2f(d1, b1), dv = WrapAngleDiff(av1 - av0);
+        float au0 = atan2f(b0, a0), au1 = atan2f(b1, a1), du = WrapAngleDiff(au1 - au0);
+        float av0 = atan2f(d0, c0), av1 = atan2f(d1, c1), dv = WrapAngleDiff(av1 - av0);
         if (fabsf(du) > 2.35f || fabsf(dv) > 2.35f) return p;
         p.mode = 2;
         const float v[] = {su0, su1 - su0, au0, du, sv0, sv1 - sv0, av0, dv, tx0, dtx, ty0, dty};
@@ -69,14 +70,14 @@ static void ApplyMatrix(const MatrixPlan& p, float t, uint16_t* out) {
         float a, b, c, d;
         if (p.mode == 3) {
             a = su * p.v[2];
-            c = su * p.v[3];
-            b = sv * p.v[6];
+            b = su * p.v[3];
+            c = sv * p.v[6];
             d = sv * p.v[7];
         } else {
             const float au = p.v[2] + p.v[3] * t, av = p.v[6] + p.v[7] * t;
             a = su * cosf(au);
-            c = su * sinf(au);
-            b = sv * cosf(av);
+            b = su * sinf(au);
+            c = sv * cosf(av);
             d = sv * sinf(av);
         }
         values = _mm_setr_ps(a, b, c, d);
